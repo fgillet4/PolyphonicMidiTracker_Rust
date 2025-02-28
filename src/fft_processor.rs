@@ -69,7 +69,7 @@ impl FFTProcessor {
                 windowed_buffer[i] = self.buffer[buffer_idx] * self.window[i];
             }
             
-            // Perform FFT
+            // Prepare for FFT
             let mut output_complex = vec![Complex32::new(0.0, 0.0); self.fft_size / 2 + 1];
             
             // Perform the FFT

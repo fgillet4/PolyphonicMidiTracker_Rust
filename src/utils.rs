@@ -1,5 +1,3 @@
-// src/utils.rs
-
 pub fn db_to_gain(db: f32) -> f32 {
     10.0_f32.powf(db / 20.0)
 }

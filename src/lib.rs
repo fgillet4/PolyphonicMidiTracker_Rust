@@ -10,7 +10,6 @@ mod spectral_analysis;
 mod note_detection;
 mod midi_output;
 mod utils;
-mod ui;
 
 // Main plugin struct
 pub struct GuitarMidiTracker {
@@ -30,6 +29,9 @@ pub struct GuitarMidiTracker {
     // Visualization data for UI
     fft_magnitude_buffer: Vec<f32>,
     detected_notes: Vec<u8>,
+    
+    // Buffer for processing
+    sample_counter: usize,
 }
 
 #[derive(Params)]
@@ -54,9 +56,6 @@ struct GuitarMidiTrackerParams {
     
     #[id = "load_learned_data"]
     pub load_learned_data: BoolParam,
-    
-    #[persist = "editor_state"]
-    editor_state: Arc<parking_lot::RwLock<ui::EditorState>>,
 }
 
 impl Default for GuitarMidiTrackerParams {
@@ -89,40 +88,24 @@ impl Default for GuitarMidiTrackerParams {
                 60.0, // Middle C
                 FloatRange::Linear { min: 40.0, max: 90.0 }
             )
-            .with_value_to_string(formatters::v2s_f32_midi_note())
-            .with_string_to_value(formatters::s2v_f32_midi_note()),
+            .with_value_to_string(Arc::new(|v| format!("{} ({})", v, utils::midi_note_to_name(v as u8))))
+            .with_string_to_value(Arc::new(|s| s.parse::<f32>().ok())),
             
             save_learned_data: BoolParam::new("Save Learned Data", false)
-                .with_callback({
-                    let learning_mode = Arc::new(AtomicBool::new(false));
-                    let learning_mode_clone = learning_mode.clone();
-                    
-                    Arc::new(move |value| {
-                        if value {
-                            // Trigger save functionality
-                            println!("Saving learned data...");
-                            // Reset parameter after handling
-                            learning_mode_clone.store(false, Ordering::Relaxed);
-                        }
-                    })
-                }),
+                .with_callback(Arc::new(move |value| {
+                    if value {
+                        // Trigger save functionality
+                        println!("Saving learned data...");
+                    }
+                })),
                 
             load_learned_data: BoolParam::new("Load Learned Data", false)
-                .with_callback({
-                    let load_trigger = Arc::new(AtomicBool::new(false));
-                    let load_trigger_clone = load_trigger.clone();
-                    
-                    Arc::new(move |value| {
-                        if value {
-                            // Trigger load functionality
-                            println!("Loading learned data...");
-                            // Reset parameter after handling
-                            load_trigger_clone.store(false, Ordering::Relaxed);
-                        }
-                    })
-                }),
-                
-            editor_state: Arc::new(parking_lot::RwLock::new(ui::EditorState::default())),
+                .with_callback(Arc::new(move |value| {
+                    if value {
+                        // Trigger load functionality
+                        println!("Loading learned data...");
+                    }
+                })),
         }
     }
 }
@@ -138,15 +121,16 @@ impl Default for GuitarMidiTracker {
             note_detector: note_detection::NoteDetector::new(),
             fft_magnitude_buffer: Vec::new(),
             detected_notes: Vec::new(),
+            sample_counter: 0,
         }
     }
 }
 
 impl Plugin for GuitarMidiTracker {
-    const NAME: &'static str = "Guitar MIDI Tracker";
-    const VENDOR: &'static str = "Your Name";
+    const NAME: &'static str = "GuitarMIDITracker";
+    const VENDOR: &'static str = "FrancisBrain";
     const URL: &'static str = "https://your-website.com";
-    const EMAIL: &'static str = "your.email@example.com";
+    const EMAIL: &'static str = "fgillet4@gmail.com";
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
     const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[
@@ -162,7 +146,7 @@ impl Plugin for GuitarMidiTracker {
         },
     ];
 
-    const MIDI_INPUT: MidiConfig = MidiConfig::None;
+    const MIDI_INPUT: MidiConfig = MidiConfig::Basic;
     const MIDI_OUTPUT: MidiConfig = MidiConfig::Basic;
     const SAMPLE_ACCURATE_AUTOMATION: bool = true;
 
@@ -173,19 +157,17 @@ impl Plugin for GuitarMidiTracker {
         self.params.clone()
     }
 
-    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        ui::create_editor(self.params.clone())
-    }
-
     fn initialize(
         &mut self,
         _audio_io_layout: &AudioIOLayout,
         buffer_config: &BufferConfig,
         _context: &mut impl InitContext<Self>,
     ) -> bool {
+        nih_log!("GuitarMIDITracker: Initializing with sample rate: {}", buffer_config.sample_rate);
         self.sample_rate = buffer_config.sample_rate;
         self.fft_processor.initialize(buffer_config.sample_rate);
         self.note_detector.initialize(buffer_config.sample_rate);
+        self.sample_counter = 0;
         
         true
     }
@@ -193,6 +175,7 @@ impl Plugin for GuitarMidiTracker {
     fn reset(&mut self) {
         self.fft_processor.reset();
         self.note_detector.reset();
+        self.sample_counter = 0;
     }
 
     fn process(
@@ -201,92 +184,64 @@ impl Plugin for GuitarMidiTracker {
         _aux: &mut AuxiliaryBuffers,
         context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        // Process audio buffer
-        let num_samples = buffer.samples();
-        let num_channels = buffer.channels();
-        
+        nih_log!("GuitarMIDITracker: Processing audio buffer");
         // Check if we should be in learning mode
         let learning_mode = self.params.learning_mode.value();
         self.learning_mode.store(learning_mode, Ordering::Relaxed);
+        let learning_note_midi = self.params.learning_note.value() as u8;
         
-        if learning_mode {
-            // Learning mode - analyze individual notes
-            let learning_note_midi = self.params.learning_note.value() as u8;
-            self.current_learning_note.store(learning_note_midi as f32, Ordering::Relaxed);
+        // Process the buffer sample by sample
+        for mut channels in buffer.iter_samples() {
+            // Calculate the average input from all channels
+            let mut input_sample = 0.0;
+            let mut sample_count = 0;
             
-            // Process audio for learning
-            for i in 0..num_samples {
-                // Get mono input (average channels if stereo)
-                let mut input_sample = 0.0;
-                for channel in 0..num_channels.min(2) {
-                    input_sample += buffer[channel][i];
-                }
-                input_sample /= num_channels.min(2) as f32;
+            // Iterate through all channels at this sample position
+            for channel_sample in channels.iter_mut() {
+                input_sample += *channel_sample;
+                sample_count += 1;
+            }
+            
+            if sample_count > 0 {
+                input_sample /= sample_count as f32;
                 
                 // Apply input gain
                 let gain = self.params.input_gain.smoothed.next();
                 input_sample *= utils::db_to_gain(gain);
                 
-                // Process the sample for learning
+                // Process the sample through FFT
                 self.fft_processor.process_sample(input_sample);
                 
-                // For passthrough monitoring, copy input to output
-                for channel in 0..buffer.channels() {
-                    buffer[channel][i] = input_sample;
+                // Write the processed sample to all output channels
+                for channel_sample in channels.iter_mut() {
+                    *channel_sample = input_sample;
                 }
-            }
-            
-            // Check if we have a complete FFT frame
-            if self.fft_processor.is_frame_complete() {
-                let spectrum = self.fft_processor.compute_spectrum();
                 
-                // Update FFT visualization buffer
-                self.fft_magnitude_buffer = spectrum.clone();
-                
-                // Learn the current note
-                let note_midi = self.current_learning_note.load(Ordering::Relaxed) as u8;
-                learning::learn_note(&mut self.note_detector, note_midi, &spectrum);
-            }
-        } else {
-            // Tracking mode - detect notes from polyphonic input
-            for i in 0..num_samples {
-                // Get mono input (average channels if stereo)
-                let mut input_sample = 0.0;
-                for channel in 0..num_channels.min(2) {
-                    input_sample += buffer[channel][i];
+                // Track samples for FFT analysis
+                self.sample_counter += 1;
+                if self.sample_counter >= 4096 {
+                    self.sample_counter = 0;
+                    
+                    // When we have enough samples, compute the spectrum
+                    let spectrum = self.fft_processor.compute_spectrum();
+                    self.fft_magnitude_buffer = spectrum.clone();
+                    
+                    if learning_mode {
+                        // Learning mode - learn the current note
+                        learning::learn_note(&mut self.note_detector, learning_note_midi, &spectrum);
+                    } else {
+                        // Tracking mode - detect notes
+                        let max_notes = self.params.max_polyphony.value() as usize;
+                        let sensitivity = self.params.sensitivity.value();
+                        let detected_notes = self.note_detector.detect_notes(&spectrum, max_notes, sensitivity);
+                        
+                        // Output MIDI notes
+                        midi_output::output_midi_notes(context, &detected_notes, &self.detected_notes);
+                        
+                        // Update stored note state
+                        self.detected_notes = detected_notes;
+                    }
                 }
-                input_sample /= num_channels.min(2) as f32;
-                
-                // Apply input gain
-                let gain = self.params.input_gain.smoothed.next();
-                input_sample *= utils::db_to_gain(gain);
-                
-                // Process the sample for note detection
-                self.fft_processor.process_sample(input_sample);
-                
-                // For passthrough monitoring, copy input to output
-                for channel in 0..buffer.channels() {
-                    buffer[channel][i] = input_sample;
-                }
-            }
-            
-            // Check if we have a complete FFT frame
-            if self.fft_processor.is_frame_complete() {
-                let spectrum = self.fft_processor.compute_spectrum();
-                
-                // Update FFT visualization buffer
-                self.fft_magnitude_buffer = spectrum.clone();
-                
-                // Detect notes from the spectrum
-                let max_notes = self.params.max_polyphony.value() as usize;
-                let sensitivity = self.params.sensitivity.value();
-                let detected_notes = self.note_detector.detect_notes(&spectrum, max_notes, sensitivity);
-                
-                // Output MIDI notes
-                midi_output::output_midi_notes(context, &detected_notes, &self.detected_notes);
-                
-                // Update our stored note state
-                self.detected_notes = detected_notes;
             }
         }
         
@@ -309,14 +264,14 @@ impl ClapPlugin for GuitarMidiTracker {
 }
 
 impl Vst3Plugin for GuitarMidiTracker {
-    const VST3_CLASS_ID: [u8; 16] = *b"GuitarMIDITracker";
+    const VST3_CLASS_ID: [u8; 16] = *b"GuitarMIDITrackr"; // 16 bytes exactly
     const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[
         Vst3SubCategory::Fx,
-        Vst3SubCategory::Tools,
+        Vst3SubCategory::Instrument,
         Vst3SubCategory::Analyzer,
     ];
 }
 
+// Export the plugins using the proper macro syntax
 nih_export_clap!(GuitarMidiTracker);
 nih_export_vst3!(GuitarMidiTracker);
-nih_export_standalone!(GuitarMidiTracker);

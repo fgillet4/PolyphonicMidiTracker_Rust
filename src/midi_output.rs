@@ -1,4 +1,3 @@
-// src/midi_output.rs
 use nih_plug::prelude::*;
 
 pub fn output_midi_notes<P: Plugin>(
