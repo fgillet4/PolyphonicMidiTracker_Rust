@@ -1,0 +1,28 @@
+[package]
+name = "guitar_midi_tracker"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "Guitar to MIDI converter VST3 plugin"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["standalone", "vst3"] }
+realfft = "3.3.0"  # For FFT processing
+rubato = "0.14.1"  # For resampling if needed
+hound = "3.5.0"    # For WAV file handling during learning phase
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+atomic_float = "0.1"
+egui = "0.22.0"  # For the UI
+num-complex = "0.4.3"  # For complex numbers in FFT
+parking_lot = "0.12.1"  # For RwLock in editor state
+
+[workspace]
+members = ["xtask"]
+
+[profile.release]
+lto = "thin"
+strip = true
